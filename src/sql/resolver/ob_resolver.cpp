@@ -83,6 +83,7 @@
 #include "sql/resolver/cmd/ob_set_names_resolver.h"
 #include "sql/resolver/cmd/ob_set_transaction_resolver.h"
 #include "sql/resolver/cmd/ob_empty_query_resolver.h"
+#include "sql/resolver/dml/ob_copy_resolver.h"
 #include "sql/resolver/cmd/ob_anonymous_block_resolver.h"
 #include "sql/resolver/cmd/ob_call_procedure_resolver.h"
 #include "sql/resolver/cmd/ob_load_data_resolver.h"
@@ -500,6 +501,10 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_EMPTY_QUERY: {
         REGISTER_STMT_RESOLVER(EmptyQuery);
+        break;
+      }
+      case T_COPY_TO: {
+        REGISTER_STMT_RESOLVER(Copy);
         break;
       }
       case T_FLUSH_PRIVILEGES: {

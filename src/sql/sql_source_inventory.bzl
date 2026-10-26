@@ -1367,6 +1367,7 @@ SQL_UNITY_GROUPS = [
         srcs = [
             "src/sql/resolver/dml/ob_aggr_expr_push_up_analyzer.cpp",
             "src/sql/resolver/dml/ob_column_namespace_checker.cpp",
+            "src/sql/resolver/dml/ob_copy_resolver.cpp",
             "src/sql/resolver/dml/ob_default_value_utils.cpp",
             "src/sql/resolver/dml/ob_del_upd_resolver.cpp",
             "src/sql/resolver/dml/ob_del_upd_stmt.cpp",
@@ -1374,6 +1375,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/resolver/dml/ob_delete_stmt.cpp",
             "src/sql/resolver/dml/ob_dml_resolver.cpp",
             "src/sql/resolver/dml/ob_dml_stmt.cpp",
+            "src/sql/resolver/dml/ob_file_table_reader.cpp",
             "src/sql/resolver/dml/ob_group_by_checker.cpp",
             "src/sql/resolver/dml/ob_insert_resolver.cpp",
             "src/sql/resolver/dml/ob_insert_stmt.cpp",

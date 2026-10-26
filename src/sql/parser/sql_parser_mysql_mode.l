@@ -1734,6 +1734,11 @@ BEGIN(in_c_comment);
   }
 }
 
+"read_csv" { return READ_CSV; }
+"read_json" { return READ_JSON; }
+"read_parquet" { return READ_PARQUET; }
+"glob" { return GLOB; }
+
 {identifier} {
   const NonReservedKeyword *word = NULL;
   if (IS_FAST_PARAMETERIZE) {

@@ -2544,6 +2544,19 @@
     "background_cn": "纯兼容性变量。不支持 performance_schema 系统变量，导致 8.0 JDBC 驱动在连接认证后初始化系统变量阶段执行 select @performance_schema 抛出异常",
     "ref_url": ""
   },
+  "enable_file_sql": {
+    "id": 10754,
+    "name": "enable_file_sql",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "enables querying local files (CSV, JSONL, Parquet) as tables with read_csv/read_json/read_parquet/glob",
+    "flags": "GLOBAL | SESSION | INFLUENCE_PLAN",
+    "publish_version": "320",
+    "info_cn": "控制是否允许把本地文件当作表查询，以及是否允许 COPY 导出查询结果",
+    "background_cn": "文件访问属于本地资源访问，默认关闭；打开后 read_csv/read_json/read_parquet/glob 与 COPY 语句才可用",
+    "ref_url": ""
+  },
   "_ob_proxy_session_temporary_table_used": {
     "id": 10116,
     "placeholder": true,

@@ -23,6 +23,7 @@
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/resolver/dml/ob_select_stmt.h"
 #include "sql/resolver/expr/ob_shared_expr_resolver.h"
+#include "sql/resolver/dml/ob_file_table_reader.h"
 namespace oceanbase
 {
 namespace sql
@@ -807,6 +808,16 @@ private:
   int add_udt_dependency(const pl::ObUserDefinedType &udt_type);
   int add_obj_to_llc_bitmap(const ObObj &obj, char *llc_bitmap, double &num_null);
   int compute_values_table_row_count(ObValuesTableDef &table_def);
+
+  // file table: read_csv/read_json/read_parquet/glob
+  int resolve_file_table_item(const ParseNode &table_node, TableItem *&table_item);
+  int resolve_file_table_options(const ParseNode &func_node,
+                                 const ParseNode *arg_node,
+                                 ObFileReadOptions &options);
+  int resolve_file_table_path(const ParseNode &path_node, ObString &path);
+  int gen_file_table_column_items(TableItem &table_item,
+                                  const ObIArray<ObFileColumnMeta> &columns,
+                                  const ObCollationType cs_type);
 protected:
   struct GenColumnExprInfo {
     GenColumnExprInfo():

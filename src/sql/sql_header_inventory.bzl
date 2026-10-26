@@ -134,6 +134,7 @@ SQL_PUBLIC_HEADER_ROOTS = [
     "resolver/dml/ob_delete_resolver.h",
     "resolver/dml/ob_dml_resolver.h",
     "resolver/dml/ob_dml_stmt.h",
+    "resolver/dml/ob_file_table_reader.h",
     "resolver/dml/ob_select_resolver.h",
     "resolver/expr/ob_raw_expr.h",
     "resolver/expr/ob_raw_expr_modify_column_name.h",
