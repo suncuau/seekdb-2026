@@ -24,6 +24,7 @@
 #include "sql/parser/parse_malloc.h"
 #include "query/vector/ob_vector_index_util.h"
 #include "sql/das/ob_domain_id.h"
+#include "share/ai_service/ob_ai_column_spec.h"
 
 namespace oceanbase
 {
@@ -481,6 +482,116 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
   return ret;
 }
 
+// Collect the AI columns whose cached value has to be reset by the statement:
+// an AI column is invalidated when the statement assigns one of the columns its
+// expression depends on, or one of the row key columns of the table.
+static int calc_ai_invalidated_column_ids(const ObTableSchema &table_schema,
+                                          const ObIArray<ObAssignment> &assignments,
+                                          ObIArray<uint64_t> &invalidated_column_ids,
+                                          ObIArray<uint64_t> &invalidated_state_column_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 8> assigned_column_ids;
+  bool rowkey_assigned = false;
+  const int64_t prefix_len = static_cast<int64_t>(strlen(share::AI_COLUMN_SPEC_PREFIX));
+  for (int64_t i = 0; OB_SUCC(ret) && i < assignments.count(); ++i) {
+    const ObColumnRefRawExpr *column_expr = assignments.at(i).column_expr_;
+    const ObColumnSchemaV2 *assigned_column = NULL;
+    if (OB_ISNULL(column_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null assignment column", K(ret));
+    } else if (OB_FAIL(assigned_column_ids.push_back(column_expr->get_column_id()))) {
+      LOG_WARN("failed to push back the assigned column id", K(ret));
+    } else if (OB_ISNULL(assigned_column =
+                             table_schema.get_column_schema(column_expr->get_column_id()))) {
+      // the column does not belong to the base table schema, ignore it
+    } else if (assigned_column->is_rowkey_column()) {
+      rowkey_assigned = true;
+    }
+  }
+  for (ObTableSchema::const_column_iterator it = table_schema.column_begin();
+       OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+    const ObColumnSchemaV2 *spec_column = *it;
+    share::ObAiColumnSpec spec;
+    bool invalidated = false;
+    if (OB_ISNULL(spec_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null column", K(ret));
+    } else if (!spec_column->is_hidden()) {
+      // only the hidden __ai_spec_ columns carry an ai column specification
+    } else if (spec_column->get_column_name_str().length() <= prefix_len
+               || 0 != strncmp(spec_column->get_column_name_str().ptr(),
+                               share::AI_COLUMN_SPEC_PREFIX, prefix_len)) {
+      // not an ai column spec column
+    } else if (OB_FAIL(spec.decode(spec_column->get_comment_str()))) {
+      LOG_WARN("failed to decode the ai column spec", K(ret));
+    } else if (assignments.empty()) {
+      // nothing is assigned, nothing can become stale
+    } else {
+      const ObString &spec_name = spec_column->get_column_name_str();
+      const ObString result_name(spec_name.length() - static_cast<int32_t>(prefix_len),
+                                 spec_name.ptr() + prefix_len);
+      const ObColumnSchemaV2 *result_column = table_schema.get_column_schema(result_name);
+      if (OB_ISNULL(result_column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ai column result column not found", K(ret), K(result_name));
+      } else {
+        const ObString deps = spec.dependency_columns_;
+        int64_t start = 0;
+        char state_name_buf[512];
+        ObString state_name;
+        const ObColumnSchemaV2 *state_column = NULL;
+        bool state_assigned = false;
+        if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_STATE_PREFIX,
+                                                      result_name,
+                                                      state_name_buf,
+                                                      static_cast<int64_t>(sizeof(state_name_buf)),
+                                                      state_name))) {
+          LOG_WARN("failed to make the ai state column name", K(ret), K(result_name));
+        } else if (NULL != (state_column = table_schema.get_column_schema(state_name))) {
+          state_assigned = has_exist_in_array(assigned_column_ids,
+                                              state_column->get_column_id());
+        }
+        // Assigning the ai column itself (the RETRY AI COLUMN statement does
+        // this) invalidates its cached value just like a dependency change.
+        // The only writer that assigns the hidden state column is the
+        // generator that publishes a fresh value, and that value is what the
+        // state describes, so it must not invalidate itself.
+        invalidated = !state_assigned
+            && (rowkey_assigned
+                || has_exist_in_array(assigned_column_ids, result_column->get_column_id()));
+        while (OB_SUCC(ret) && !invalidated && start < deps.length()) {
+          int64_t end = start;
+          while (end < deps.length() && ',' != deps.ptr()[end]) {
+            ++end;
+          }
+          const ObString dep_name(static_cast<int32_t>(end - start), deps.ptr() + start);
+          const ObColumnSchemaV2 *dep_column = NULL;
+          if (!dep_name.empty()
+              && NULL != (dep_column = table_schema.get_column_schema(dep_name))) {
+            invalidated = has_exist_in_array(assigned_column_ids,
+                                             dep_column->get_column_id());
+          }
+          start = end + 1;
+        }
+        if (OB_SUCC(ret) && invalidated) {
+          if (OB_FAIL(invalidated_column_ids.push_back(result_column->get_column_id()))) {
+            LOG_WARN("failed to push back the invalidated ai column", K(ret));
+          } else if (NULL != state_column) {
+            // The hidden state column has to be reset together with the result,
+            // otherwise the stale READY/FAILED state would survive the update.
+            if (OB_FAIL(invalidated_state_column_ids.push_back(
+                    state_column->get_column_id()))) {
+              LOG_WARN("failed to push back the invalidated ai state column", K(ret));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
                                                      const ObStmtScope scope)
 {
@@ -499,6 +610,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
     LOG_WARN("invalid input scope", K(scope));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < assigns.count(); ++i) {
+    ObSEArray<uint64_t, 4> ai_invalidated_column_ids;
+    ObSEArray<uint64_t, 4> ai_invalidated_state_column_ids;
     if (OB_ISNULL(schema_checker_) ||
         OB_ISNULL(schema_guard = schema_checker_->get_schema_guard()) ||
         OB_ISNULL(table_item = stmt->get_table_item_by_id(assigns.at(i).table_id_))) {
@@ -517,7 +630,27 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                                  schema_guard,
                                                                  assigns.at(i).assignments_,
                                                                  update_with_vector_index))) {
+    } else if (OB_FAIL(calc_ai_invalidated_column_ids(*table_schema,
+                                                      assigns.at(i).assignments_,
+                                                      ai_invalidated_column_ids,
+                                                      ai_invalidated_state_column_ids))) {
     } else {
+      // The statement writes the invalidated result column itself. When that
+      // column carries a vector index, its hidden vid column has to be
+      // refreshed together with the value, exactly like an explicitly assigned
+      // vector column: leaving the old vid behind would keep a stale index
+      // entry that the next write of the column collides with.
+      for (int64_t j = 0; OB_SUCC(ret) && !update_with_vector_index
+                          && j < ai_invalidated_column_ids.count(); ++j) {
+        ObIndexType ai_index_type = INDEX_TYPE_MAX;
+        if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(*table_schema,
+                                                                     *schema_guard,
+                                                                     ai_invalidated_column_ids.at(j),
+                                                                     update_with_vector_index,
+                                                                     ai_index_type))) {
+          LOG_WARN("failed to check the vector index of the invalidated ai column", K(ret));
+        }
+      }
       for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
           (OB_SUCCESS == ret && iter != table_schema->column_end()); ++iter) {
         ColumnItem *col_item = NULL;
@@ -538,6 +671,9 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
+        } else if (FALSE_IT(need_assigned = need_assigned ||
+                            has_exist_in_array(ai_invalidated_column_ids, column_id) ||
+                            has_exist_in_array(ai_invalidated_state_column_ids, column_id))) {
         } else if (need_assigned) {
           // for insert scope, on duplicate key update column list already
           // exists in insert list, therefore, only need to add assignment.
@@ -553,7 +689,24 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           } else {
             assignment.column_expr_ = col_item->expr_;
             assignment.is_implicit_ = true;
-            if (column_schema->is_on_update_current_timestamp()) {
+            if (has_exist_in_array(ai_invalidated_column_ids, column_id)) {
+              // reset the stale cached value of the ai column
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_,
+                                                          assignment.expr_))) {
+                LOG_WARN("failed to build the ai column reset expr", K(ret));
+              }
+            } else if (has_exist_in_array(ai_invalidated_state_column_ids, column_id)) {
+              // reset the hidden state of the ai column to PENDING
+              ObConstRawExpr *state_expr = NULL;
+              if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*params_.expr_factory_,
+                                                               ObInt32Type,
+                                                               share::AI_COLUMN_STATE_PENDING,
+                                                               state_expr))) {
+                LOG_WARN("failed to build the ai column state reset expr", K(ret));
+              } else {
+                assignment.expr_ = state_expr;
+              }
+            } else if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);
               if (OB_FAIL(utils.build_now_expr(col_item, assignment.expr_))) {

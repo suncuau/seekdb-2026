@@ -753,6 +753,8 @@ int ObServer::init(const ObServerOptions &opts, const ObPLogWriterCfg &log_cfg)
       LOG_ERROR("parse role failed", KR(ret));
     } else if (OB_FAIL(init_sql_proxy())) {
       LOG_ERROR("init sql connection pool failed", KR(ret));
+    } else if (OB_FAIL(ai_column_worker_.init())) {
+      LOG_ERROR("init ai column worker failed", KR(ret));
     }
     if (OB_SUCC(ret)) {
     if (OB_FAIL(ObDeviceManager::get_instance().init_devices_env())) {
@@ -1036,6 +1038,10 @@ void ObServer::destroy()
     FLOG_INFO("begin to destroy tmp page cache");
     tmp_file::ObTmpPageCache::get_instance().destroy();
     FLOG_INFO("tmp page cache destroyed");
+
+    FLOG_INFO("begin to destroy ai column worker");
+    ai_column_worker_.destroy();
+    FLOG_INFO("ai column worker destroyed");
 
     FLOG_INFO("begin to destroy net frame");
     net_frame_.destroy();
@@ -1335,6 +1341,12 @@ int ObServer::start()
       LOG_ERROR("fail to start standby gRPC service", KR(ret));
     }
 
+    if (FAILEDx(ai_column_worker_.start())) {
+      LOG_ERROR("fail to start ai column worker", KR(ret));
+    } else {
+      FLOG_INFO("success to start ai column worker");
+    }
+
   int64_t start_service_time = ObTimeUtility::current_time();
   if (OB_FAIL(ret)) {
     LOG_ERROR("failure occurs, stop observer startup", KR(ret));
@@ -1612,6 +1624,11 @@ int ObServer::stop()
     FLOG_INFO("begin to stop ctas clean up timer");
     ctas_clean_up_timer_.stop();
     FLOG_INFO("ctas clean up timer stopped");
+
+    FLOG_INFO("begin to stop ai column worker");
+    ai_column_worker_.stop();
+    ai_column_worker_.wait();
+    FLOG_INFO("ai column worker stopped");
 
     FLOG_INFO("begin to stop inner sql proxy");
     sql_proxy_.stop();

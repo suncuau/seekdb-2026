@@ -245,6 +245,11 @@ public:
   static int get_json_object_form_str(ObIAllocator &allocator, ObString &str, ObJsonObject *&obj_node);
   static int print_json_to_str(ObIAllocator &allocator, ObIJsonBase *base_node, ObString &str);
   static int compact_json_object(ObIAllocator &allocator, ObJsonObject *obj_node, ObJsonObject *compact_obj);
+  // deep copy a json node so that it can be attached to another json tree
+  static int get_json_node_copy(ObIAllocator &allocator, ObIJsonBase *node, ObIJsonBase *&node_copy);
+  // read an integer member of a json object, found is false when the key is absent
+  static int get_json_int_member(ObIAllocator &allocator, ObJsonObject *obj_node,
+                                 const char *key, int64_t &value, bool &found);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncJsonUtils);
 };
@@ -337,6 +342,16 @@ public:
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id,
                               share::schema::ObSchemaGetterGuard &guard, ObAIFuncExprInfo *&info);
   static int get_ai_func_info(ObIAllocator &allocator, const ObString &model_id, ObAIFuncExprInfo *&info);
+  // optional settings carried by the ai model endpoint, they are configured by the user
+  // instead of being hardcoded for a specific model
+  struct ObAIEndpointParams
+  {
+    int64_t dimensions_;
+    int64_t batch_size_;
+    ObAIEndpointParams() : dimensions_(0), batch_size_(0) {}
+  };
+  static int parse_endpoint_params(ObIAllocator &allocator, const ObString &parameters, ObAIEndpointParams &params);
+  static constexpr int64_t DEFAULT_EMBED_BATCH_SIZE = 20;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncUtils);
 };
@@ -377,8 +392,15 @@ public:
   ObAIFuncPromptObjectUtils() {}
   virtual ~ObAIFuncPromptObjectUtils() {}
   static bool is_valid_prompt_object(ObJsonObject* prompt_object);
+  // render the prompt object into the final prompt text, all placeholders are replaced
+  static int replace_all_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
+  // kept for compatibility, it renders the prompt object as well
   static int replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
+  // a prompt object nested in the args of another prompt object
+  static bool is_nested_prompt_object(ObJsonObject *obj_node);
+  // render one argument into the text used to replace its placeholder
+  static int render_arg_to_text(ObIAllocator &allocator, ObJsonNode *arg_node, ObString &arg_text);
   static constexpr char prompt_template_key[20] = "template";
   static constexpr char prompt_args_key[20] = "args";
 private:

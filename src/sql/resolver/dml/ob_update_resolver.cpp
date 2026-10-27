@@ -16,6 +16,8 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_update_resolver.h"
+#include "share/ai_service/ob_ai_column_spec.h"
+#include "sql/resolver/expr/ob_raw_expr_util.h"
 
 namespace oceanbase
 {
@@ -533,6 +535,200 @@ int ObUpdateResolver::resolve_update_constraints()
           }
         }
       }
+    }
+  }
+  return ret;
+}
+
+ObAiColumnRetryResolver::ObAiColumnRetryResolver(ObResolverParams &params)
+  : ObUpdateResolver(params), target_column_name_()
+{
+}
+
+ObAiColumnRetryResolver::~ObAiColumnRetryResolver()
+{
+}
+
+bool ObAiColumnRetryResolver::is_status_pseudo_column(const ObQualifiedName &q_name) const
+{
+  // the pseudo column is only available for unquoted references, a quoted
+  // `status` keeps addressing the physical column of the table
+  return !q_name.is_quoted_
+      && !q_name.col_name_.empty()
+      && 0 == q_name.col_name_.case_compare("status");
+}
+
+int ObAiColumnRetryResolver::resolve(const ParseNode &parse_tree)
+{
+  int ret = OB_SUCCESS;
+  const ParseNode *assign_list = NULL;
+  const ParseNode *assign_item = NULL;
+  const ParseNode *column_ref = NULL;
+  const ParseNode *name_node = NULL;
+  if (OB_UNLIKELY(T_UPDATE != parse_tree.type_)
+      || OB_UNLIKELY(parse_tree.num_child_ <= UPDATE_LIST)
+      || OB_ISNULL(parse_tree.children_)
+      || OB_ISNULL(assign_list = parse_tree.children_[UPDATE_LIST])
+      || OB_UNLIKELY(T_ASSIGN_LIST != assign_list->type_)
+      || OB_UNLIKELY(1 != assign_list->num_child_)
+      || OB_ISNULL(assign_item = assign_list->children_[0])
+      || OB_UNLIKELY(T_ASSIGN_ITEM != assign_item->type_)
+      || OB_UNLIKELY(2 > assign_item->num_child_)
+      || OB_ISNULL(column_ref = assign_item->children_[0])
+      || OB_UNLIKELY(T_COLUMN_REF != column_ref->type_)
+      || OB_UNLIKELY(3 > column_ref->num_child_)
+      || OB_ISNULL(name_node = column_ref->children_[2])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid ai column retry parse tree", K(ret));
+  } else {
+    target_column_name_.assign_ptr(name_node->str_value_,
+                                    static_cast<int32_t>(name_node->str_len_));
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ObUpdateResolver::resolve(parse_tree))) {
+      LOG_WARN("failed to resolve the ai column retry statement", K(ret));
+    } else if (OB_FAIL(check_target_is_ai_column())) {
+      LOG_WARN("the retried column is not an ai column", K(ret), K(target_column_name_));
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnRetryResolver::check_target_is_ai_column()
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  const TableItem *table_item = NULL;
+  const ObTableSchema *table_schema = NULL;
+  char spec_name_buf[512];
+  ObString spec_name;
+  if (OB_ISNULL(stmt) || OB_ISNULL(schema_checker_) || OB_ISNULL(params_.expr_factory_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the resolver is not initialized", K(ret));
+  } else if (stmt->get_table_items().empty()
+             || OB_ISNULL(table_item = stmt->get_table_items().at(0))
+             || OB_UNLIKELY(!table_item->is_basic_table())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected table item of the ai column retry statement", K(ret));
+  } else if (OB_FAIL(schema_checker_->get_table_schema(
+      table_item->get_base_table_item().ref_id_, table_schema))) {
+    LOG_WARN("failed to get the table schema", K(ret));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null table schema", K(ret));
+  } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_SPEC_PREFIX,
+                                                       target_column_name_,
+                                                       spec_name_buf,
+                                                       static_cast<int64_t>(sizeof(spec_name_buf)),
+                                                       spec_name))) {
+    LOG_WARN("failed to make the ai spec column name", K(ret), K(target_column_name_));
+  } else if (NULL == table_schema->get_column_schema(spec_name)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+  }
+  return ret;
+}
+
+int ObAiColumnRetryResolver::resolve_column_ref_expr(const ObQualifiedName &q_name,
+                                                     ObRawExpr *&real_ref_expr)
+{
+  int ret = OB_SUCCESS;
+  if (is_status_pseudo_column(q_name)) {
+    if (OB_FAIL(resolve_status_pseudo_column(real_ref_expr))) {
+      LOG_WARN("failed to resolve the status pseudo column", K(ret));
+    }
+  } else if (OB_FAIL(ObDMLResolver::resolve_column_ref_expr(q_name, real_ref_expr))) {
+    LOG_WARN_IGNORE_COL_NOTFOUND(ret, "failed to resolve the column reference",
+                                 K(ret), K(q_name));
+  }
+  return ret;
+}
+
+// Build the expression of the retry-only pseudo column STATUS:
+//   case when __ai_state_<c> = 0 then 'PENDING'
+//        when __ai_state_<c> = 1 then 'READY'
+//        when __ai_state_<c> = 2 then 'FAILED'
+//        else null end
+int ObAiColumnRetryResolver::resolve_status_pseudo_column(ObRawExpr *&real_ref_expr)
+{
+  int ret = OB_SUCCESS;
+  ObDMLStmt *stmt = get_stmt();
+  const TableItem *table_item = NULL;
+  ColumnItem *state_col_item = NULL;
+  ObRawExpr *state_ref = NULL;
+  ObRawExprFactory *factory = params_.expr_factory_;
+  char state_name_buf[512];
+  ObString state_name;
+  if (OB_ISNULL(stmt) || OB_ISNULL(factory) || OB_ISNULL(schema_checker_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the resolver is not initialized", K(ret));
+  } else if (stmt->get_table_items().empty()
+             || OB_ISNULL(table_item = stmt->get_table_items().at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected table item of the ai column retry statement", K(ret));
+  } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_STATE_PREFIX,
+                                                       target_column_name_,
+                                                       state_name_buf,
+                                                       static_cast<int64_t>(sizeof(state_name_buf)),
+                                                       state_name))) {
+    LOG_WARN("failed to make the ai state column name", K(ret), K(target_column_name_));
+  } else if (OB_FAIL(resolve_basic_column_item(*table_item, state_name, true, state_col_item))) {
+    if (OB_ERR_BAD_FIELD_ERROR == ret) {
+      // the target column has no ai state column, so it is not an ai column
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    }
+    LOG_WARN("failed to resolve the ai state column", K(ret), K(state_name));
+  } else if (OB_ISNULL(state_col_item) || OB_ISNULL(state_ref = state_col_item->expr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null ai state column", K(ret));
+  } else {
+    ObConstRawExpr *state_pending = NULL;
+    ObConstRawExpr *state_ready = NULL;
+    ObConstRawExpr *state_failed = NULL;
+    ObConstRawExpr *name_pending = NULL;
+    ObConstRawExpr *name_ready = NULL;
+    ObConstRawExpr *name_failed = NULL;
+    ObRawExpr *null_expr = NULL;
+    ObRawExpr *when_pending = NULL;
+    ObRawExpr *when_ready = NULL;
+    ObRawExpr *when_failed = NULL;
+    ObRawExpr *case_failed = NULL;
+    ObRawExpr *case_ready = NULL;
+    ObRawExpr *case_pending = NULL;
+    if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*factory, ObInt32Type,
+                                                     share::AI_COLUMN_STATE_PENDING,
+                                                     state_pending))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*factory, ObInt32Type,
+                                                            share::AI_COLUMN_STATE_READY,
+                                                            state_ready))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*factory, ObInt32Type,
+                                                            share::AI_COLUMN_STATE_FAILED,
+                                                            state_failed))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+        *factory, ObVarcharType, ObString::make_string("PENDING"),
+        CS_TYPE_UTF8MB4_GENERAL_CI, name_pending))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+        *factory, ObVarcharType, ObString::make_string("READY"),
+        CS_TYPE_UTF8MB4_GENERAL_CI, name_ready))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(
+        *factory, ObVarcharType, ObString::make_string("FAILED"),
+        CS_TYPE_UTF8MB4_GENERAL_CI, name_failed))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_null_expr(*factory, null_expr))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_common_binary_op_expr(
+        *factory, T_OP_EQ, state_ref, state_failed, when_failed))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_case_when_expr(
+        *factory, when_failed, name_failed, null_expr, case_failed))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_common_binary_op_expr(
+        *factory, T_OP_EQ, state_ref, state_ready, when_ready))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_case_when_expr(
+        *factory, when_ready, name_ready, case_failed, case_ready))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_common_binary_op_expr(
+        *factory, T_OP_EQ, state_ref, state_pending, when_pending))) {
+    } else if (OB_FAIL(ObRawExprUtils::build_case_when_expr(
+        *factory, when_pending, name_pending, case_ready, case_pending))) {
+    } else {
+      real_ref_expr = case_pending;
     }
   }
   return ret;

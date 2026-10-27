@@ -2,6 +2,13 @@
 
 OBSERVER_UNITY_GROUPS = [
     struct(
+        name = "ob_server_ai_column_0",
+        language = "c++",
+        srcs = [
+            "src/observer/ob_ai_column_worker.cpp",
+        ],
+    ),
+    struct(
         name = "ob_server_ai_service_0",
         language = "c++",
         srcs = [

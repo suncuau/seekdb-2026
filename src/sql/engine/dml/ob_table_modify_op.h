@@ -35,6 +35,15 @@ enum ObDmlSnapshotOptState
   USE_STMT_SNAPSHOT_STATE = 2,
 };
   
+// Metadata of a user visible AI column of the table being modified.
+struct ObAiColumnMeta
+{
+  ObAiColumnMeta() : column_id_(common::OB_INVALID_ID) {}
+  uint64_t column_id_;
+  common::ObString column_name_;
+  common::ObString dependency_columns_;
+};
+
 class ForeignKeyHandle
 {
 public:
@@ -231,6 +240,37 @@ public:
   int end_nested_session();
   int execute_write(const char *sql);
   int execute_read(const char *sql, common::ObMySQLProxy::MySQLResult &res);
+  // Maintain the asynchronous regeneration tasks of the AI columns of the
+  // modified rows in __all_ai_column_task. assign_columns == NULL means every AI
+  // column of the table (used by INSERT), otherwise only the AI columns that are
+  // implicitly assigned (reset to NULL) by the statement are touched.
+  int create_ai_column_tasks(const ObDMLBaseCtDef &dml_ctdef,
+                             const common::ObIArray<ObExpr *> &row,
+                             const common::ObIArray<ColumnContent> *assign_columns = NULL);
+  // Delete the tasks of one row. only_columns == NULL deletes the tasks of every
+  // AI column (the row is gone), otherwise only the tasks of the given columns
+  // are removed and an empty list is a no-op.
+  int delete_ai_column_tasks(const ObDMLBaseCtDef &dml_ctdef,
+                             const common::ObIArray<ObExpr *> &row,
+                             const common::ObIArray<ObAiColumnMeta> *only_columns = NULL);
+  int recreate_ai_column_tasks(const ObUpdCtDef &upd_ctdef,
+                               const common::ObIArray<ObExpr *> &old_row,
+                               const common::ObIArray<ObExpr *> &new_row);
+  uint64_t gen_ai_request_id();
+  int get_ai_table_schema(const uint64_t table_id,
+                          const share::schema::ObTableSchema *&table_schema);
+  int resolve_ai_table_schema(const uint64_t ref_table_id,
+                              const share::schema::ObTableSchema *&table_schema,
+                              uint64_t &table_id);
+  int get_ai_column_meta(const share::schema::ObTableSchema &table_schema,
+                         common::ObIArray<ObAiColumnMeta> &ai_columns);
+  int build_ai_rowkey_predicate(const ObDMLBaseCtDef &dml_ctdef,
+                                const share::schema::ObTableSchema &table_schema,
+                                const common::ObIArray<ObExpr *> &row,
+                                common::ObIAllocator &alloc,
+                                common::ObString &predicate);
+  int execute_ai_task_sql(common::ObSqlString &sql,
+                          common::ObSqlString *pre_sql = NULL);
   int check_stack();
   bool is_nested_session() { return ObSQLUtils::is_nested_sql(&ctx_); }
   bool is_fk_nested_session() { return ObSQLUtils::is_fk_nested_sql(&ctx_); }
@@ -304,6 +344,7 @@ public:
   ObIInnerSQLConnection::SavedValue saved_conn_;
   bool need_foreign_key_check_;
   bool need_close_conn_;
+  int64_t ai_task_seq_;
 
   ObObjPrintParams obj_print_params_;
   bool iter_end_;

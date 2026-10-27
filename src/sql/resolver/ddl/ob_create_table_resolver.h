@@ -22,6 +22,7 @@
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_column_schema.h"
+#include "share/ai_service/ob_ai_column_spec.h"
 #include "share/config/ob_server_config.h"
 
 namespace oceanbase
@@ -48,6 +49,26 @@ public:
     uint64_t col_id_;
     ObRawExpr *gen_col_expr_;
   };
+  // One AI column collected while resolving the column definitions. The three
+  // hidden columns and the __all_ai_column metadata row are created after all
+  // columns of the table have been resolved.
+  struct AiColumnEntry
+  {
+    AiColumnEntry()
+        : column_name_(),
+          raw_expr_(),
+          func_type_(share::AI_COLUMN_FUNC_INVALID),
+          max_retries_(0),
+          sync_mode_()
+    {}
+    TO_STRING_KV(K_(column_name), K_(raw_expr), K_(func_type), K_(max_retries), K_(sync_mode));
+    common::ObString column_name_;
+    common::ObString raw_expr_;
+    share::ObAiColumnFuncType func_type_;
+    int64_t max_retries_;
+    common::ObString sync_mode_;
+  };
+
   explicit ObCreateTableResolver(ObResolverParams &params);
   virtual ~ObCreateTableResolver();
 
@@ -75,6 +96,8 @@ private:
   int64_t get_primary_key_size() const;
   int add_primary_key_part(const common::ObString &column_name, common::ObArray<ObColumnResolveStat> &stats, int64_t &pk_data_length);
   int add_hidden_tablet_seq_col();
+  int resolve_ai_columns(common::ObIArray<AiColumnEntry> &entries,
+                         share::schema::ObTableSchema &table_schema);
   int check_column_name_duplicate(const ParseNode *node);
   int resolve_primary_key_node(const ParseNode &pk_node, common::ObArray<ObColumnResolveStat> &stats);
   int resolve_table_elements(const ParseNode *node,

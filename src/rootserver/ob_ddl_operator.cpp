@@ -35,6 +35,9 @@
 #include "share/schema/ob_user_sql_service.h"
 #include "sql/optimizer/stat/ob_dbms_stats_maintenance_window.h"
 #include "pl/pl_cache/ob_pl_cache_mgr.h"
+#include "share/ob_dml_sql_splicer.h"
+#include "share/inner_table/ob_inner_table_schema.h"
+#include "share/ai_service/ob_ai_column_spec.h"
 #include "share/schema/ob_dependency_info.h"  // relocated-definition owner
 #include "share/schema/ob_multi_version_schema_service.h"  // relocated-definition owner
 
@@ -570,6 +573,7 @@ int ObDDLOperator::create_table(ObTableSchema &table_schema,
         is_truncate_table))) {
     } else if (OB_FAIL(sync_version_for_cascade_table(table_schema.get_depend_table_ids(), trans))) {
     } else if (OB_FAIL(sync_version_for_cascade_mock_fk_parent_table(table_schema.get_depend_mock_fk_parent_table_ids(), trans))) {
+    } else if (OB_FAIL(create_ai_column_metadata(table_schema, trans))) {
     }
   }
 
@@ -578,6 +582,100 @@ int ObDDLOperator::create_table(ObTableSchema &table_schema,
       OB_FAIL(ObVectorIndexUtil::add_dbms_vector_jobs(trans,
                                                       table_schema.get_table_id(),
                                                       table_schema.get_exec_env()))) {
+  }
+  return ret;
+}
+
+int ObDDLOperator::create_ai_column_metadata(const share::schema::ObTableSchema &table_schema,
+                                             common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObTableSchema::const_column_iterator it = table_schema.column_begin();
+  for (; OB_SUCC(ret) && it != table_schema.column_end(); ++it) {
+    const ObColumnSchemaV2 *spec_column = *it;
+    if (OB_ISNULL(spec_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null column", K(ret));
+    } else if (!spec_column->is_hidden()) {
+      // only the hidden __ai_spec_ columns carry an ai column specification
+    } else {
+      const ObString &hidden_name = spec_column->get_column_name_str();
+      const int64_t prefix_len = static_cast<int64_t>(strlen(share::AI_COLUMN_SPEC_PREFIX));
+      if (hidden_name.length() <= prefix_len
+          || 0 != strncmp(hidden_name.ptr(), share::AI_COLUMN_SPEC_PREFIX, prefix_len)) {
+        // not an ai column spec column
+      } else if (OB_FAIL(insert_ai_column_metadata(
+                    table_schema,
+                    ObString(hidden_name.length() - static_cast<int32_t>(prefix_len),
+                             hidden_name.ptr() + prefix_len),
+                    *spec_column,
+                    trans))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDDLOperator::insert_ai_column_metadata(const share::schema::ObTableSchema &table_schema,
+                                             const ObString &ai_column_name,
+                                             const ObColumnSchemaV2 &spec_column,
+                                             common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *result_column = table_schema.get_column_schema(ai_column_name);
+  char name_buf[OB_MAX_COLUMN_NAME_LENGTH * 2];
+  ObString state_name;
+  ObString request_name;
+  const ObColumnSchemaV2 *state_column = NULL;
+  const ObColumnSchemaV2 *request_column = NULL;
+  share::ObAiColumnSpec spec;
+  ObDMLSqlSplicer sql;
+  ObSqlString buffer;
+  int64_t affected_rows = 0;
+  if (OB_ISNULL(result_column)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column not found", K(ret), K(ai_column_name));
+  } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_STATE_PREFIX,
+                                                       ai_column_name,
+                                                       name_buf,
+                                                       static_cast<int64_t>(sizeof(name_buf)),
+                                                       state_name))) {
+  } else if (OB_ISNULL(state_column = table_schema.get_column_schema(state_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column state column not found", K(ret), K(ai_column_name));
+  } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_REQUEST_PREFIX,
+                                                       ai_column_name,
+                                                       name_buf,
+                                                       static_cast<int64_t>(sizeof(name_buf)),
+                                                       request_name))) {
+  } else if (OB_ISNULL(request_column = table_schema.get_column_schema(request_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column request column not found", K(ret), K(ai_column_name));
+  } else if (OB_FAIL(spec.decode(spec_column.get_comment_str()))) {
+    LOG_WARN("failed to decode ai column spec", K(ret), K(ai_column_name));
+  } else if (OB_FAIL(sql.add_pk_column("table_id", table_schema.get_table_id()))) {
+  } else if (OB_FAIL(sql.add_pk_column("column_id", result_column->get_column_id()))) {
+  } else if (OB_FAIL(sql.add_column("column_name", ObHexEscapeSqlStr(ai_column_name)))) {
+  } else if (OB_FAIL(sql.add_column("state_column_id", state_column->get_column_id()))) {
+  } else if (OB_FAIL(sql.add_column("request_column_id", request_column->get_column_id()))) {
+  } else if (OB_FAIL(sql.add_column("result_spec_column_id", spec_column.get_column_id()))) {
+  } else if (OB_FAIL(sql.add_column("max_retries", spec.max_retries_))) {
+  } else if (OB_FAIL(sql.add_column("sync_mode", ObHexEscapeSqlStr(spec.sync_mode_)))) {
+  } else if (OB_FAIL(sql.add_column("result_type", ObHexEscapeSqlStr(spec.result_type_)))) {
+  } else if (OB_FAIL(sql.add_column("model_name", ObHexEscapeSqlStr(spec.model_name_)))) {
+  } else if (OB_FAIL(sql.add_column("normalized_expr", ObHexEscapeSqlStr(spec.normalized_expr_)))) {
+  } else if (OB_FAIL(sql.add_column("raw_expr", ObHexEscapeSqlStr(spec.raw_expr_)))) {
+  } else if (OB_FAIL(sql.add_column("dependency_columns", ObHexEscapeSqlStr(spec.dependency_columns_)))) {
+  } else if (OB_FAIL(sql.add_gmt_create())) {
+  } else if (OB_FAIL(sql.add_gmt_modified())) {
+    // The metadata row is also rewritten by the ALTER TABLE path, so the write
+    // has to be idempotent: an existing row is updated in place.
+  } else if (OB_FAIL(sql.splice_insert_update_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+  } else if (OB_FAIL(trans.write(buffer.ptr(), affected_rows))) {
+    LOG_WARN("failed to write ai column metadata", K(ret), K(buffer));
+  } else if (affected_rows < 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected affected rows", K(ret), K(affected_rows));
   }
   return ret;
 }

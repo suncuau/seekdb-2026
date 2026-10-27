@@ -60,6 +60,31 @@ private:
   int generate_batched_stmt_info();
 };
 
+// Resolves the synthetic UPDATE statement built for
+//   ALTER TABLE t RETRY AI COLUMN c [WHERE ...]
+// The statement itself is a regular single table update that assigns NULL to
+// the retried AI column, which invalidates the cached value and lets the engine
+// schedule a new task. The only addition is the retry-only pseudo column STATUS:
+// an unquoted STATUS in the WHERE clause maps to the hidden state column of the
+// retried AI column, while a quoted `status` keeps addressing the physical
+// column of the table.
+class ObAiColumnRetryResolver : public ObUpdateResolver
+{
+public:
+  explicit ObAiColumnRetryResolver(ObResolverParams &params);
+  virtual ~ObAiColumnRetryResolver();
+
+  virtual int resolve(const ParseNode &parse_tree);
+  virtual int resolve_column_ref_expr(const ObQualifiedName &q_name,
+                                      ObRawExpr *&real_ref_expr);
+private:
+  bool is_status_pseudo_column(const ObQualifiedName &q_name) const;
+  int resolve_status_pseudo_column(ObRawExpr *&real_ref_expr);
+  int check_target_is_ai_column();
+private:
+  common::ObString target_column_name_;
+};
+
 } // namespace sql
 } // namespace oceanbase
 #endif /* OCEANBASE_SQL_RESOLVER_DML_OB_UPDATE_RESOLVER_H_ */

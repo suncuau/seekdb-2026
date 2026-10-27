@@ -94,6 +94,12 @@
 #include "sql/resolver/cmd/ob_get_diagnostics_resolver.h"
 #include "sql/resolver/dcl/ob_alter_role_resolver.h"
 #include "sql/pl/ob_pl_package.h"
+#include "sql/parser/sql_parser_base.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "share/ai_service/ob_ai_column_spec.h"
+#include "share/ob_server_struct.h"
+#include "sql/resolver/dml/ob_update_stmt.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
 
 namespace oceanbase
 {
@@ -137,6 +143,308 @@ int ObResolver::select_stmt_resolver_func(ObResolverParams &params, const ParseN
   return ret;
 }
 
+// Build the synthetic UPDATE statement that executes
+//   ALTER TABLE t RETRY AI COLUMN c [WHERE ...]
+// The update assigns NULL to the AI column. The resolver turns that assignment
+// into the implicit reset assignment of the column, which invalidates the
+// cached value and lets the engine schedule a new AI task for every row that
+// matches the predicate.
+static int build_ai_column_retry_update(const ParseNode &alter_node,
+                                        const ParseNode &retry_node,
+                                        common::ObIAllocator &allocator,
+                                        ParseNode *&update_node)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *relation_node = NULL;
+  ParseNode *column_name_node = NULL;
+  ParseNode *where_node = NULL;
+  ParseNode *table_refs = NULL;
+  ParseNode *column_ref = NULL;
+  ParseNode *null_node = NULL;
+  ParseNode *assign_item = NULL;
+  ParseNode *assign_list = NULL;
+  update_node = NULL;
+  if (OB_UNLIKELY(T_ALTER_TABLE != alter_node.type_) || 2 > alter_node.num_child_
+      || OB_ISNULL(alter_node.children_)
+      || OB_ISNULL(relation_node = alter_node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid alter table parse tree for ai column retry", K(ret));
+  } else if (OB_UNLIKELY(T_AI_COLUMN_RETRY != retry_node.type_)
+             || 2 > retry_node.num_child_
+             || OB_ISNULL(retry_node.children_)
+             || OB_ISNULL(column_name_node = retry_node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid ai column retry parse node", K(ret));
+  } else {
+    where_node = retry_node.children_[1];
+  }
+  if (OB_SUCC(ret)
+      && (OB_ISNULL(table_refs = new_non_terminal_node(&allocator,
+                                                       T_TABLE_REFERENCES,
+                                                       1,
+                                                       relation_node))
+          || OB_ISNULL(null_node = new_terminal_node(&allocator, T_NULL))
+          || OB_ISNULL(column_ref = new_non_terminal_node(&allocator,
+                                                          T_COLUMN_REF,
+                                                          3,
+                                                          NULL,
+                                                          NULL,
+                                                          column_name_node))
+          || OB_ISNULL(assign_item = new_non_terminal_node(&allocator,
+                                                           T_ASSIGN_ITEM,
+                                                           2,
+                                                           column_ref,
+                                                           null_node))
+          || OB_ISNULL(assign_list = new_non_terminal_node(&allocator,
+                                                           T_ASSIGN_LIST,
+                                                           1,
+                                                           assign_item))
+          || OB_ISNULL(update_node = new_non_terminal_node(&allocator,
+                                                           T_UPDATE,
+                                                           11,
+                                                           NULL,        /* 0. with clause */
+                                                           table_refs,  /* 1. table node */
+                                                           assign_list, /* 2. update list */
+                                                           where_node,  /* 3. where node */
+                                                           NULL,        /* 4. order by node */
+                                                           NULL,        /* 5. limit node */
+                                                           NULL,        /* 6. when node */
+                                                           NULL,        /* 7. hint node */
+                                                           NULL,        /* 8. ignore */
+                                                           NULL,        /* 9. returning */
+                                                           NULL)))) {   /* 10. error logging clause */
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate the ai column retry parse tree", K(ret));
+  }
+  return ret;
+}
+
+// Key of a column referenced by a statement, used to deduplicate the AI column
+// strict read check.
+struct ObAiStrictColumnKey
+{
+  ObAiStrictColumnKey() : table_id_(common::OB_INVALID_ID), column_id_(common::OB_INVALID_ID) {}
+  ObAiStrictColumnKey(const uint64_t table_id, const uint64_t column_id)
+      : table_id_(table_id), column_id_(column_id) {}
+  bool operator==(const ObAiStrictColumnKey &other) const
+  {
+    return table_id_ == other.table_id_ && column_id_ == other.column_id_;
+  }
+  uint64_t table_id_;
+  uint64_t column_id_;
+};
+
+// Returns true when at least one row of the AI column does not carry the READY
+// state. The hidden state column is only readable from an inner session, which
+// is exactly what the sql proxy session is.
+static int ai_column_has_unfinished_rows(common::ObMySQLProxy &sql_proxy,
+                                         const ObString &database_name,
+                                         const ObString &table_name,
+                                         const ObString &state_column_name,
+                                         bool &incomplete)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  incomplete = false;
+  if (OB_FAIL(sql.append_fmt("select 1 from `%.*s`.`%.*s` "
+                             "where `%.*s` is null or `%.*s` <> %d limit 1",
+                             database_name.length(),
+                             database_name.ptr(),
+                             table_name.length(),
+                             table_name.ptr(),
+                             state_column_name.length(),
+                             state_column_name.ptr(),
+                             state_column_name.length(),
+                             state_column_name.ptr(),
+                             static_cast<int>(share::AI_COLUMN_STATE_READY)))) {
+    LOG_WARN("failed to build the ai column strict read query", K(ret));
+  } else {
+    SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = NULL;
+      if (OB_FAIL(sql_proxy.read(res, sql.ptr()))) {
+        LOG_WARN("failed to execute the ai column strict read query", K(ret), K(sql));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null mysql result", K(ret));
+      } else if (OB_FAIL(result->next())) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("failed to fetch the ai column strict read result", K(ret));
+        }
+      } else {
+        incomplete = true;
+      }
+    }
+  }
+  return ret;
+}
+
+// Collect the AI columns whose cached value the statement itself resets through
+// an implicit assignment. Such a column is being regenerated, so its stale
+// state must not reject the statement.
+static int collect_implicit_ai_columns(ObDMLStmt &stmt,
+                                       ObIArray<ObAiStrictColumnKey> &columns)
+{
+  int ret = OB_SUCCESS;
+  if (stmt.is_update_stmt()) {
+    const ObIArray<ObUpdateTableInfo*> &table_infos =
+        static_cast<ObUpdateStmt&>(stmt).get_update_table_info();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_infos.count(); ++i) {
+      const ObUpdateTableInfo *table_info = table_infos.at(i);
+      if (OB_ISNULL(table_info)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        for (int64_t j = 0; OB_SUCC(ret) && j < table_info->assignments_.count(); ++j) {
+          const ObAssignment &assignment = table_info->assignments_.at(j);
+          if (assignment.is_implicit_ && OB_NOT_NULL(assignment.column_expr_)) {
+            if (OB_FAIL(columns.push_back(ObAiStrictColumnKey(
+                    assignment.column_expr_->get_table_id(),
+                    assignment.column_expr_->get_column_id())))) {
+              LOG_WARN("failed to push back the implicit ai column", K(ret));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int check_ai_column_strict_read_stmt(ObResolverParams &params,
+                                            common::ObMySQLProxy &sql_proxy,
+                                            ObDMLStmt &stmt,
+                                            const ObIArray<ObAiStrictColumnKey> &implicit_columns,
+                                            ObIArray<ObAiStrictColumnKey> &checked_columns);
+
+// Walk the statement and its subqueries, and reject the statement when one of
+// the AI columns it references is not completely READY.
+static int check_ai_column_strict_read(ObResolverParams &params, ObDMLStmt &stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  common::ObMySQLProxy *sql_proxy = params.sql_proxy_;
+  ObSQLSessionInfo *session_info = params.session_info_;
+  ObSEArray<ObAiStrictColumnKey, 8> implicit_columns;
+  ObSEArray<ObAiStrictColumnKey, 8> checked_columns;
+  if (OB_ISNULL(session_info) || OB_ISNULL(params.schema_checker_)) {
+    ret = OB_NOT_INIT;
+  } else if (session_info->is_inner()) {
+    // server side statements (ai task maintenance, ...) are not user reads
+  } else if (OB_FAIL(session_info->get_ai_column_strict_read(strict_read))) {
+    LOG_WARN("failed to get ai_column_strict_read", K(ret));
+  } else if (!strict_read) {
+    // strict reads are disabled
+  } else if (OB_ISNULL(sql_proxy) && OB_ISNULL(sql_proxy = GCTX.sql_proxy_)) {
+    LOG_WARN("no sql proxy available, skip the ai column strict read check");
+  } else if (OB_FAIL(collect_implicit_ai_columns(stmt, implicit_columns))) {
+    LOG_WARN("failed to collect the implicit ai columns", K(ret));
+  } else if (OB_FAIL(check_ai_column_strict_read_stmt(params,
+                                                      *sql_proxy,
+                                                      stmt,
+                                                      implicit_columns,
+                                                      checked_columns))) {
+    LOG_WARN("failed to check the ai column strict read", K(ret));
+  }
+  return ret;
+}
+
+static int check_ai_column_strict_read_stmt(ObResolverParams &params,
+                                            common::ObMySQLProxy &sql_proxy,
+                                            ObDMLStmt &stmt,
+                                            const ObIArray<ObAiStrictColumnKey> &implicit_columns,
+                                            ObIArray<ObAiStrictColumnKey> &checked_columns)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaChecker *schema_checker = params.schema_checker_;
+  ObSQLSessionInfo *session_info = params.session_info_;
+  const ObIArray<ColumnItem> &column_items = stmt.get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+    const ColumnItem &column_item = column_items.at(i);
+    const TableItem *table_item = NULL;
+    const TableItem *base_table_item = NULL;
+    const ObTableSchema *table_schema = NULL;
+    const ObColumnSchemaV2 *column_schema = NULL;
+    const ObAiStrictColumnKey key(column_item.table_id_, column_item.column_id_);
+    char spec_name_buf[512];
+    char state_name_buf[512];
+    ObString spec_name;
+    ObString state_name;
+    if (OB_ISNULL(table_item = stmt.get_table_item_by_id(column_item.table_id_))) {
+      // the column belongs to a table item of another statement level
+    } else if (!table_item->is_basic_table()) {
+      // generated, joined or function tables have no ai column of their own
+    } else if (FALSE_IT(base_table_item = &table_item->get_base_table_item())) {
+    } else if (has_exist_in_array(implicit_columns, key)) {
+      // the statement resets the ai column itself, there is nothing stale to read
+    } else if (has_exist_in_array(checked_columns, key)) {
+      // already checked
+    } else if (OB_FAIL(schema_checker->get_table_schema(base_table_item->ref_id_,
+                                                        table_schema))) {
+      LOG_WARN("failed to get the table schema", K(ret), K(base_table_item->ref_id_));
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null table schema", K(ret));
+    } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(column_item.column_id_))) {
+      // the column is not part of the base table schema
+    } else if (column_schema->is_hidden()) {
+      // the hidden state/spec columns are not user visible
+    } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_SPEC_PREFIX,
+                                                         column_schema->get_column_name_str(),
+                                                         spec_name_buf,
+                                                         static_cast<int64_t>(sizeof(spec_name_buf)),
+                                                         spec_name))) {
+      LOG_WARN("failed to make the ai spec column name", K(ret));
+    } else if (NULL == table_schema->get_column_schema(spec_name)) {
+      // an ordinary column
+    } else if (OB_FAIL(share::ai_column_make_hidden_name(share::AI_COLUMN_STATE_PREFIX,
+                                                         column_schema->get_column_name_str(),
+                                                         state_name_buf,
+                                                         static_cast<int64_t>(sizeof(state_name_buf)),
+                                                         state_name))) {
+      LOG_WARN("failed to make the ai state column name", K(ret));
+    } else {
+      bool incomplete = false;
+      const ObString &database_name = base_table_item->database_name_.empty()
+          ? session_info->get_database_name() : base_table_item->database_name_;
+      if (OB_FAIL(checked_columns.push_back(key))) {
+        LOG_WARN("failed to push back the checked ai column", K(ret));
+      } else if (OB_FAIL(ai_column_has_unfinished_rows(sql_proxy,
+                                                       database_name,
+                                                       base_table_item->table_name_,
+                                                       state_name,
+                                                       incomplete))) {
+        LOG_WARN("failed to check the ai column state", K(ret),
+                 K(database_name), K(base_table_item->table_name_), K(state_name));
+      } else if (incomplete) {
+        ret = OB_AI_COLUMN_STRICT_READ_INCOMPLETE;
+        LOG_USER_ERROR(OB_AI_COLUMN_STRICT_READ_INCOMPLETE,
+                       static_cast<int64_t>(base_table_item->ref_id_),
+                       static_cast<int64_t>(column_item.column_id_));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    const ObIArray<ObQueryRefRawExpr*> &subqueries = stmt.get_subquery_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < subqueries.count(); ++i) {
+      ObQueryRefRawExpr *query_ref = subqueries.at(i);
+      ObSelectStmt *subquery_stmt = NULL;
+      if (OB_ISNULL(query_ref)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_ISNULL(subquery_stmt = query_ref->get_ref_stmt())) {
+        // the subquery was not resolved
+      } else if (OB_FAIL(SMART_CALL(check_ai_column_strict_read_stmt(params,
+                                                                     sql_proxy,
+                                                                     *subquery_stmt,
+                                                                     implicit_columns,
+                                                                     checked_columns)))) {
+        LOG_WARN("failed to check the ai column strict read of a subquery", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObStmt *&stmt)
 {
 #define REGISTER_STMT_RESOLVER(name)                                   \
@@ -152,6 +460,7 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   int ret = OB_SUCCESS;
   const ParseNode *real_parse_tree = NULL;
   int64_t questionmark_count = 0;
+  bool is_ai_column_retry = false;
   UNUSED(if_prepared);
   if (OB_ISNULL(params_.allocator_)
       || OB_ISNULL(params_.schema_checker_)
@@ -181,7 +490,49 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
       case T_ALTER_TABLE: {
-        REGISTER_STMT_RESOLVER(AlterTable);
+        const ParseNode *action_list = NULL;
+        const ParseNode *retry_action = NULL;
+        int64_t action_count = 0;
+        if (OB_NOT_NULL(real_parse_tree->children_) && real_parse_tree->num_child_ > 1) {
+          action_list = real_parse_tree->children_[1];
+        }
+        if (OB_NOT_NULL(action_list)) {
+          action_count = action_list->num_child_;
+          for (int64_t i = 0; NULL == retry_action && i < action_count; ++i) {
+            if (OB_NOT_NULL(action_list->children_[i])
+                && T_AI_COLUMN_RETRY == action_list->children_[i]->type_) {
+              retry_action = action_list->children_[i];
+            }
+          }
+        }
+        if (NULL == retry_action) {
+          REGISTER_STMT_RESOLVER(AlterTable);
+        } else if (1 != action_count) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("cannot combine AI COLUMN RETRY with another alter action", K(ret));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+        } else {
+          ParseNode *update_node = NULL;
+          if (OB_FAIL(build_ai_column_retry_update(*real_parse_tree,
+                                                   *retry_action,
+                                                   *params_.allocator_,
+                                                   update_node))) {
+            LOG_WARN("failed to build the ai column retry statement", K(ret));
+          } else if (OB_FAIL(stmt_resolver_func<ObAiColumnRetryResolver>(params_,
+                                                                        *update_node,
+                                                                        stmt))) {
+            LOG_WARN("failed to resolve the ai column retry statement", K(ret));
+          } else if (OB_ISNULL(stmt)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else {
+            is_ai_column_retry = true;
+            // the retry executes as a DML statement, not as a DDL statement
+            params_.session_info_->set_stmt_type(stmt->get_stmt_type());
+            if (NULL != exec_ctx && NULL != exec_ctx->get_sql_ctx()) {
+              exec_ctx->get_sql_ctx()->stmt_type_ = stmt->get_stmt_type();
+            }
+          }
+        }
         break;
       }
       case T_CREATE_INDEX: {
@@ -631,10 +982,18 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
         break;
       }
     }  // end switch
+
+    if (OB_SUCC(ret) && OB_NOT_NULL(stmt) && stmt->is_dml_stmt()
+        && !stmt->is_explain_stmt() && !is_ai_column_retry) {
+      if (OB_FAIL(check_ai_column_strict_read(params_, *static_cast<ObDMLStmt*>(stmt)))) {
+        LOG_WARN("failed to check the ai column strict read", K(ret));
+      }
+    }
+
     if (OB_SUCC(ret) && stmt->is_dml_write_stmt()) {
       // todo yanli:check leader-follower database
     }
-    
+
     if (OB_SUCC(ret) && stmt->is_dml_stmt() && !params_.session_info_->is_varparams_sql_prepare()) {
       ObDMLStmt *dml_stmt = static_cast<ObDMLStmt*>(stmt);
       ObRawExprWrapEnumSet enum_set_wrapper(*params_.expr_factory_, params_.session_info_);

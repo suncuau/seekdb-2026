@@ -144,6 +144,15 @@ public:
                            const common::ObString *ddl_stmt_str = NULL,
                            const bool need_sync_schema_version = true,
                            const bool is_truncate_table = false);
+  // Write the __all_ai_column metadata rows of the AI columns of the table.
+  // The AI column specification is carried by the hidden physical columns, so
+  // the row is derived from the final table schema.
+  static int create_ai_column_metadata(const share::schema::ObTableSchema &table_schema,
+                                       common::ObMySQLTransaction &trans);
+  static int insert_ai_column_metadata(const share::schema::ObTableSchema &table_schema,
+                                const common::ObString &ai_column_name,
+                                const share::schema::ObColumnSchemaV2 &spec_column,
+                                common::ObMySQLTransaction &trans);
   int truncate_table(const ObString *ddl_stmt_str,
                      const share::schema::ObTableSchema &orig_table_schema,
                      const share::schema::ObTableSchema &new_table_schema,

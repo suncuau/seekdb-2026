@@ -10441,6 +10441,7 @@ int ObDDLService::alter_table_in_trans(obcall::ObAlterTableArg &alter_table_arg,
                                                 ddl_operator,
                                                 trans,
                                                 &global_idx_schema_array))) {
+          } else if (OB_FAIL(ddl_operator.create_ai_column_metadata(new_table_schema, trans))) {
           }
         }
         //table options
