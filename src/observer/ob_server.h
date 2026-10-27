@@ -60,6 +60,7 @@
 
 #include "observer/virtual_table/ob_virtual_data_access_service.h"
 
+#include "observer/ob_ai_column_worker.h"
 #include "observer/ob_signal_handle.h"
 #include "observer/ob_internal_table_refresh_adapter.h"
 #include "observer/ob_ls_runtime_adapter.h"
@@ -423,6 +424,8 @@ private:
   // The network framework in OceanBase is all defined at ObServerNetworkFrame.
   ObSrvNetworkFrame net_frame_;
 
+  // Turns the pending AI column tasks into column values.
+  ObAiColumnWorker ai_column_worker_;
 
   common::ObMySQLProxy sql_proxy_;
   common::ObMySQLProxy ddl_sql_proxy_;

@@ -17,7 +17,10 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ai_func_utils.h"
 #include "ob_ai_func_client.h"
+#include "query/ai/ob_ai_completion.h"
+#include "query/ai/ob_ai_endpoint_resolver.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
+#include "share/rc/ob_server_runtime.h"
 
 namespace oceanbase 
 {
@@ -2061,6 +2064,169 @@ const ObString ObAIFuncModel::get_request_model_name()
 
 namespace query
 {
+
+int ObAiCompletion::call(
+    common::ObIAllocator &allocator,
+    const common::ObString &model_name,
+    const common::ObString &system_prompt,
+    const common::ObString &user_prompt,
+    common::ObString &result)
+{
+  int ret = OB_SUCCESS;
+  common::ObAIFuncExprInfo *info = nullptr;
+  share::ObAiModelEndpointInfo endpoint;
+  common::ObAIFuncIComplete *complete_provider = nullptr;
+  common::ObString unencrypted_access_key;
+  common::ObArray<common::ObString> headers;
+  common::ObJsonObject *body = nullptr;
+  common::ObJsonObject *response = nullptr;
+  common::ObIJsonBase *result_base = nullptr;
+  common::ObString request_model_name;
+  common::ObString result_str;
+  ObIAiEndpointResolver *endpoint_resolver = share::server_service<ObIAiEndpointResolver>();
+  result.reset();
+  if (OB_FAIL(common::ObAIFuncUtils::get_ai_func_info(allocator, model_name, info))) {
+    LOG_WARN("failed to get the ai model info", K(ret), K(model_name));
+  } else if (OB_ISNULL(info) || share::EndpointType::COMPLETION != info->type_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("the ai model is not a completion model", K(ret), K(model_name));
+  } else if (OB_ISNULL(endpoint_resolver)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the ai endpoint resolver is unavailable", K(ret));
+  } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(model_name, allocator, endpoint))) {
+    LOG_WARN("failed to resolve the ai model endpoint", K(ret), K(model_name));
+  } else if (OB_FAIL(common::ObAIFuncUtils::get_complete_provider(
+                 allocator, endpoint.get_provider(), complete_provider))) {
+    LOG_WARN("failed to get the ai complete provider", K(ret), K(endpoint.get_provider()));
+  } else if (OB_FAIL(endpoint.get_unencrypted_access_key(allocator, unencrypted_access_key))) {
+    LOG_WARN("failed to decrypt the ai endpoint access key", K(ret));
+  } else if (OB_FAIL(complete_provider->get_header(allocator, unencrypted_access_key, headers))) {
+    LOG_WARN("failed to build the ai request headers", K(ret));
+  } else {
+    common::ObString system_content = system_prompt;
+    common::ObString user_content = user_prompt;
+    request_model_name = endpoint.get_request_model_name().empty()
+        ? info->model_ : endpoint.get_request_model_name();
+    if (OB_FAIL(complete_provider->get_body(allocator, request_model_name, system_content,
+                                            user_content, nullptr /*config*/, body))) {
+      LOG_WARN("failed to build the ai request body", K(ret));
+    } else {
+      common::ObAIFuncClient client;
+      if (OB_FAIL(client.send_post(allocator, endpoint.get_url(), headers, body, response))) {
+        LOG_WARN("failed to send the ai request", K(ret), K(endpoint.get_url()));
+      } else if (OB_FAIL(complete_provider->parse_output(allocator, response, result_base))) {
+        LOG_WARN("failed to parse the ai response", K(ret));
+      } else if (OB_ISNULL(result_base)) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("the ai response carries no content", K(ret));
+      } else if (common::ObJsonNodeType::J_STRING == result_base->json_type()
+                 && static_cast<common::ObJsonString *>(result_base)->get_str().empty()) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("the ai response content is empty", K(ret));
+      } else if (OB_FAIL(common::ObAIFuncJsonUtils::print_json_to_str(
+                     allocator, result_base, result_str))) {
+        LOG_WARN("failed to print the ai response content", K(ret));
+      } else if (result_str.empty()) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("the ai response content is empty", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator, result_str, result))) {
+        LOG_WARN("failed to copy the ai response content", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAiEmbedding::call(
+    common::ObIAllocator &allocator,
+    const common::ObString &model_name,
+    const common::ObString &input,
+    common::ObString &result)
+{
+  int ret = OB_SUCCESS;
+  common::ObAIFuncExprInfo *info = nullptr;
+  share::ObAiModelEndpointInfo endpoint;
+  common::ObAIFuncIEmbed *embed_provider = nullptr;
+  common::ObString unencrypted_access_key;
+  common::ObArray<common::ObString> headers;
+  common::ObJsonObject *body = nullptr;
+  common::ObJsonObject *response = nullptr;
+  common::ObIJsonBase *result_base = nullptr;
+  common::ObString result_str;
+  ObIAiEndpointResolver *endpoint_resolver = share::server_service<ObIAiEndpointResolver>();
+  result.reset();
+  if (input.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("the ai embedding input is empty", K(ret), K(model_name));
+  } else if (OB_FAIL(common::ObAIFuncUtils::get_ai_func_info(allocator, model_name, info))) {
+    LOG_WARN("failed to get the ai model info", K(ret), K(model_name));
+  } else if (OB_ISNULL(info) || share::EndpointType::DENSE_EMBEDDING != info->type_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("the ai model is not a dense embedding model", K(ret), K(model_name));
+  } else if (OB_ISNULL(endpoint_resolver)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the ai endpoint resolver is unavailable", K(ret));
+  } else if (OB_FAIL(endpoint_resolver->resolve_by_model_name(model_name, allocator, endpoint))) {
+    LOG_WARN("failed to resolve the ai model endpoint", K(ret), K(model_name));
+  } else if (OB_FAIL(common::ObAIFuncUtils::get_embed_provider(
+                 allocator, endpoint.get_provider(), embed_provider))) {
+    LOG_WARN("failed to get the ai embed provider", K(ret), K(endpoint.get_provider()));
+  } else if (OB_FAIL(endpoint.get_unencrypted_access_key(allocator, unencrypted_access_key))) {
+    LOG_WARN("failed to decrypt the ai endpoint access key", K(ret));
+  } else if (OB_FAIL(embed_provider->get_header(allocator, unencrypted_access_key, headers))) {
+    LOG_WARN("failed to build the ai request headers", K(ret));
+  } else {
+    common::ObArray<common::ObString> contents;
+    common::ObString request_model_name = endpoint.get_request_model_name().empty()
+        ? info->model_ : endpoint.get_request_model_name();
+    if (OB_FAIL(contents.push_back(input))) {
+      LOG_WARN("failed to push back the ai embedding input", K(ret));
+    } else if (OB_FAIL(embed_provider->get_body(allocator, request_model_name, contents,
+                                                nullptr /*config*/, body))) {
+      LOG_WARN("failed to build the ai request body", K(ret));
+    } else {
+      common::ObAIFuncClient client;
+      if (OB_FAIL(client.send_post(allocator, endpoint.get_url(), headers, body, response))) {
+        LOG_WARN("failed to send the ai request", K(ret), K(endpoint.get_url()));
+      } else if (OB_FAIL(embed_provider->parse_output(allocator, response, result_base))) {
+        LOG_WARN("failed to parse the ai response", K(ret));
+      } else if (OB_ISNULL(result_base)
+                 || common::ObJsonNodeType::J_ARRAY != result_base->json_type()) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("the ai response carries no embedding array", K(ret));
+      } else {
+        common::ObJsonArray *result_array = static_cast<common::ObJsonArray *>(result_base);
+        common::ObIJsonBase *vector = 1 == result_array->element_count()
+            ? result_array->get_value(0) : nullptr;
+        if (OB_ISNULL(vector) || common::ObJsonNodeType::J_ARRAY != vector->json_type()) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("the ai response carries no embedding vector", K(ret));
+        } else {
+          common::ObJsonArray *vector_array = static_cast<common::ObJsonArray *>(vector);
+          const int64_t dimension = vector_array->element_count();
+          for (int64_t i = 0; OB_SUCC(ret) && i < dimension; ++i) {
+            common::ObIJsonBase *elem = vector_array->get_value(i);
+            if (OB_ISNULL(elem) || !share::ObJsonHelper::is_number_type(elem)) {
+              ret = OB_INVALID_DATA;
+              LOG_WARN("the ai embedding element is not a number", K(ret), K(i));
+            }
+          }
+          if (OB_SUCC(ret) && 0 == dimension) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("the ai embedding vector is empty", K(ret));
+          } else if (OB_SUCC(ret)
+                     && OB_FAIL(common::ObAIFuncJsonUtils::print_json_to_str(
+                         allocator, vector, result_str))) {
+            LOG_WARN("failed to print the ai embedding", K(ret));
+          } else if (OB_SUCC(ret) && OB_FAIL(ob_write_string(allocator, result_str, result))) {
+            LOG_WARN("failed to copy the ai embedding", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 int ObAIModelResolver::resolve_model_name(
     common::ObIAllocator &allocator,

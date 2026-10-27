@@ -1604,6 +1604,7 @@ int ObResolverUtils::resolve_column_ref(const ParseNode *node, const ObNameCaseM
       column_ref.is_star_ = true;
     } else {
       column_ref.is_star_ = false;
+      column_ref.is_quoted_ = (1 == column_node->is_input_quoted_);
       column_ref.col_name_.assign_ptr(const_cast<char *>(column_node->str_value_),
                                       static_cast<int32_t>(column_node->str_len_));
     }

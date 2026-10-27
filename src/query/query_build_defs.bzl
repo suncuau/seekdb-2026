@@ -1,6 +1,7 @@
 """Query-owned build topology exposed to its BUILD file."""
 
 QUERY_API_INTERFACE_HEADERS = [
+    "api/query/ai/ob_ai_completion.h",
     "api/query/das/ob_block_max_spec_access.h",
     "api/query/das/ob_das_id_protocol.h",
     "api/query/das/ob_das_iter_access.h",

@@ -25,6 +25,7 @@
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/vector/ob_vector_index_util.h"
+#include "share/ai_service/ob_ai_column_spec.h"
 
 namespace oceanbase
 {
@@ -3391,6 +3392,145 @@ int ObAlterTableResolver::process_timestamp_column(ObColumnResolveStat &stat,
   return ret;
 }
 
+namespace {
+
+// Add one of the hidden physical columns that back an AI column added by
+// ALTER TABLE ... ADD COLUMN. The name of the hidden column is
+// <prefix><ai column name>, the same layout as the one created by
+// CREATE TABLE.
+int add_ai_hidden_alter_column(ObAlterTableStmt &stmt,
+                               const char *prefix,
+                               const common::ObString &ai_column_name,
+                               const ObObjType data_type,
+                               const ObCharsetType charset_type,
+                               const ObCollationType collation_type,
+                               const common::ObString *comment)
+{
+  int ret = OB_SUCCESS;
+  char name_buf[OB_MAX_COLUMN_NAME_LENGTH * 2];
+  common::ObString hidden_name;
+  AlterColumnSchema column;
+  const ObAccuracy &default_accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[data_type];
+  if (OB_FAIL(share::ai_column_make_hidden_name(prefix,
+                                                ai_column_name,
+                                                name_buf,
+                                                static_cast<int64_t>(sizeof(name_buf)),
+                                                hidden_name))) {
+    SQL_RESV_LOG(WARN, "failed to make hidden column name", K(ret), K(ai_column_name));
+  } else if (OB_UNLIKELY(hidden_name.length() > OB_MAX_COLUMN_NAME_LENGTH)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "ai column name is too long");
+    SQL_RESV_LOG(WARN, "ai column name is too long", K(ret), K(ai_column_name));
+  } else {
+    column.alter_type_ = OB_DDL_ADD_COLUMN;
+    column.set_data_type(data_type);
+    column.set_data_precision(default_accuracy.get_precision());
+    column.set_data_scale(default_accuracy.get_scale());
+    if (ob_is_text_tc(data_type)) {
+      column.set_data_length(default_accuracy.get_length());
+    }
+    column.set_charset_type(charset_type);
+    column.set_collation_type(collation_type);
+    column.set_nullable(true);
+    column.set_is_hidden(true);
+    column.set_rowkey_position(0);
+    if (OB_FAIL(column.set_column_name(hidden_name))) {
+      SQL_RESV_LOG(WARN, "failed to set hidden column name", K(ret));
+    } else if (NULL != comment && OB_FAIL(column.set_comment(*comment))) {
+      SQL_RESV_LOG(WARN, "failed to set hidden column comment", K(ret));
+    } else if (OB_FAIL(stmt.add_column(column))) {
+      SQL_RESV_LOG(WARN, "failed to add hidden column", K(ret), K(hidden_name));
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
+// Create the physical representation of an AI column added by ALTER TABLE ...
+// ADD COLUMN: one hidden state column, one hidden request column and one hidden
+// spec column. The encoded spec is stored in the comment of the spec column so
+// that the DDL layer can persist the __all_ai_column metadata row without extra
+// RPC fields.
+int ObAlterTableResolver::add_ai_column_hidden_columns(ObAlterTableStmt &stmt,
+                                                       const AlterColumnSchema &ai_column,
+                                                       const ObColumnResolveStat &stat)
+{
+  int ret = OB_SUCCESS;
+  const common::ObString &ai_column_name = ai_column.get_column_name_str();
+  const ObTableSchema &table_schema = stmt.get_alter_table_schema();
+  const int64_t prefix_len = static_cast<int64_t>(strlen(share::AI_COLUMN_SPEC_PREFIX));
+  // An AI column may not depend on another AI column, otherwise the worker
+  // would need the value of an AI column to compute another AI column. Check
+  // both the AI columns added by this statement and the existing ones.
+  for (int64_t i = 0; OB_SUCC(ret) && i < ai_column_names_.count(); ++i) {
+    if (share::ai_column_expr_references_column(stat.ai_raw_expr_, ai_column_names_.at(i))) {
+      ret = OB_NOT_SUPPORTED;
+      SQL_RESV_LOG(WARN, "ai column depends on another ai column", K(ret),
+                   K(ai_column_name), K(ai_column_names_.at(i)));
+    }
+  }
+  for (ObTableSchema::const_column_iterator iter = table_schema.column_begin();
+       OB_SUCC(ret) && iter != table_schema.column_end();
+       ++iter) {
+    const ObColumnSchemaV2 *column = *iter;
+    const common::ObString &hidden_name = column->get_column_name_str();
+    if (!column->is_hidden()
+        || hidden_name.length() <= prefix_len
+        || 0 != strncmp(hidden_name.ptr(), share::AI_COLUMN_SPEC_PREFIX, prefix_len)) {
+      // not the hidden spec column of an ai column
+    } else {
+      const common::ObString other_ai_column(hidden_name.length() - static_cast<int32_t>(prefix_len),
+                                             hidden_name.ptr() + prefix_len);
+      if (share::ai_column_expr_references_column(stat.ai_raw_expr_, other_ai_column)) {
+        ret = OB_NOT_SUPPORTED;
+        SQL_RESV_LOG(WARN, "ai column depends on another ai column", K(ret),
+                     K(ai_column_name), K(other_ai_column));
+      }
+    }
+  }
+  common::ObString encoded_spec;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(share::ai_column_build_spec(
+                 table_schema,
+                 stat.ai_raw_expr_,
+                 ai_column_name,
+                 ai_column.is_json(),
+                 ob_is_integer_type(ai_column.get_data_type()),
+                 ai_column.is_collection()
+                     ? share::ai_column_vector_dim(ai_column.get_extended_type_info())
+                     : 0,
+                 stat.ai_max_retries_,
+                 stat.ai_sync_mode_,
+                 *allocator_,
+                 encoded_spec))) {
+    SQL_RESV_LOG(WARN, "failed to build ai column spec", K(ret), K(ai_column_name));
+  } else if (OB_FAIL(add_ai_hidden_alter_column(stmt,
+                                                share::AI_COLUMN_STATE_PREFIX,
+                                                ai_column_name,
+                                                ObInt32Type,
+                                                CHARSET_BINARY,
+                                                CS_TYPE_BINARY,
+                                                NULL))) {
+  } else if (OB_FAIL(add_ai_hidden_alter_column(stmt,
+                                                share::AI_COLUMN_REQUEST_PREFIX,
+                                                ai_column_name,
+                                                ObIntType,
+                                                CHARSET_BINARY,
+                                                CS_TYPE_BINARY,
+                                                NULL))) {
+  } else if (OB_FAIL(add_ai_hidden_alter_column(stmt,
+                                                share::AI_COLUMN_SPEC_PREFIX,
+                                                ai_column_name,
+                                                ObLongTextType,
+                                                CHARSET_UTF8MB4,
+                                                CS_TYPE_UTF8MB4_GENERAL_CI,
+                                                &encoded_spec))) {
+  } else if (OB_FAIL(ai_column_names_.push_back(ai_column_name))) {
+  }
+  return ret;
+}
+
 int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnNameSet &add_column_names_set)
 {
   int ret = OB_SUCCESS;
@@ -3457,6 +3597,10 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (stat.is_ai_column_
+                     && OB_FAIL(add_ai_column_hidden_columns(*alter_table_stmt,
+                                                             alter_column_schema,
+                                                             stat))) {
           }
         }
       }

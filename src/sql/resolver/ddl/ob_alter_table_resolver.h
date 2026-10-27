@@ -67,6 +67,11 @@ public:
   int resolve_convert_to_character(const ParseNode &node);
   int resolve_foreign_key_options(const ParseNode &node);
   int resolve_add_column(const ParseNode &node, ObColumnNameSet &resolve_add_column);
+  // Add the three hidden physical columns that back an AI column added by
+  // ALTER TABLE ... ADD COLUMN.
+  int add_ai_column_hidden_columns(ObAlterTableStmt &stmt,
+                                   const share::schema::AlterColumnSchema &ai_column,
+                                   const ObColumnResolveStat &stat);
   int resolve_alter_column(const ParseNode &node);
   int resolve_change_column(const ParseNode &node);
   int check_modify_column_allowed(const share::schema::AlterColumnSchema &alter_column_schema,
@@ -213,6 +218,9 @@ private:
   int64_t modify_constraint_times_;
   bool add_not_null_constraint_;
   int64_t add_column_cnt_;
+  // AI columns added by this statement, used to reject an AI column that
+  // depends on another AI column of the same table
+  common::ObSEArray<common::ObString, 4> ai_column_names_;
   DISALLOW_COPY_AND_ASSIGN(ObAlterTableResolver);
 };
 
