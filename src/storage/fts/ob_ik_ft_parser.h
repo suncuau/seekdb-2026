@@ -18,6 +18,8 @@
 #define _OCEANBASE_STORAGE_FTS_OB_IK_FT_PARSER_H_
 
 #include "lib/allocator/ob_allocator.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/thread_local/ob_tsi_factory.h"
 #include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict.h"
 #include "storage/fts/dict/ob_ft_dict_def.h"
@@ -31,6 +33,60 @@ namespace storage
 {
 class ObFTDictHub;
 
+// Caches the three built-in IK dictionaries for the current thread.
+//
+// Building them for every parse costs a bucket lock, a hash lookup and one
+// KV cache lookup per dict range, which dominates the fixed cost of parsing a
+// short text (e.g. a single tokenize() call) and is paid again for every row
+// of an index build. The built-in dictionaries are immutable once loaded, so
+// each worker thread keeps its own copy for the lifetime of the thread. The
+// cache remembers the hub it was built from and rebuilds itself if the hub is
+// re-created.
+class ObIKDictCache
+{
+public:
+  ObIKDictCache()
+      : is_inited_(false),
+        alloc_(lib::ObMemAttr("IkDictCache")),
+        main_container_(alloc_),
+        quan_container_(alloc_),
+        stop_container_(alloc_),
+        main_dict_(nullptr),
+        quan_dict_(nullptr),
+        stop_dict_(nullptr),
+        hub_(nullptr)
+  {
+  }
+  ~ObIKDictCache() { destroy(); }
+
+  int get_dicts(ObFTDictHub *hub,
+                ObIFTDict *&main_dict,
+                ObIFTDict *&quan_dict,
+                ObIFTDict *&stop_dict);
+
+private:
+  int build(ObFTDictHub *hub);
+  int build_one_dict(ObFTDictHub *hub,
+                     const ObFTDictDesc &desc,
+                     ObFTCacheRangeContainer &container,
+                     ObIFTDict *&dict);
+  void destroy();
+
+private:
+  bool is_inited_;
+  ObArenaAllocator alloc_;
+  ObFTCacheRangeContainer main_container_;
+  ObFTCacheRangeContainer quan_container_;
+  ObFTCacheRangeContainer stop_container_;
+  ObIFTDict *main_dict_;
+  ObIFTDict *quan_dict_;
+  ObIFTDict *stop_dict_;
+  // The hub the dictionaries above were built from, never owned.
+  ObFTDictHub *hub_;
+
+  DISABLE_COPY_ASSIGN(ObIKDictCache);
+};
+
 class ObIKFTParser final : public ObITokenIterator
 {
 public:
@@ -41,9 +97,6 @@ public:
         ctx_(nullptr),
         hub_(hub),
         segmenters_(allocator_),
-        cache_main_(allocator),
-        cache_quan_(allocator),
-        cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
         dict_stop_(nullptr)
@@ -69,24 +122,17 @@ private:
   int process_one_char(TokenizeContext &ctx,
                        const char *ch,
                        const uint8_t char_len,
-                       const ObFTCharUtil::CharType type);
+                       const ObFTCharUtil::CharType type,
+                       const ob_wc_t unicode);
 
 private:
   int init_dict(const ObFTParserParam &param);
-
-  int init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container);
 
   int init_segmenter(const ObFTParserParam &param);
 
   int init_ctx(const ObFTParserParam &param);
 
   void reset();
-
-  bool should_read_newest_table() const;
-
-  int build_dict_from_cache(const ObFTDictDesc &desc,
-                            ObFTCacheRangeContainer &container,
-                            ObIFTDict *&dict);
 
 private:
   static constexpr int SEGMENT_LIMIT = 1000;
@@ -98,11 +144,7 @@ private:
   ObFTDictHub *hub_;
   ObList<ObIIKProcessor *, ObIAllocator> segmenters_;
 
-  // For now there's no change of dict in one query, so we can pin dict this level.
-  ObFTCacheRangeContainer cache_main_;
-  ObFTCacheRangeContainer cache_quan_;
-  ObFTCacheRangeContainer cache_stop_;
-
+  // Borrowed from the per-thread ObIKDictCache, never owned by this parser.
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;

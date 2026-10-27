@@ -47,10 +47,17 @@ public:
 
   int current_char(const char *&ch, uint8_t &char_len);
   int current_char_type(ObFTCharUtil::CharType &type);
+  // Fetch everything the segmenters need with a single call: the char pointer, its
+  // encoded length, its class and its unicode codepoint (decoded once per char).
+  int current_char_info(const char *&ch,
+                        uint8_t &char_len,
+                        ObFTCharUtil::CharType &type,
+                        ob_wc_t &unicode);
 
   int step_next();
 
   ObCollationType collation() const;
+  ObCharsetType cs_type() const;
   int64_t get_end_cursor() const;
   const char *fulltext() const;
   int64_t fulltext_len() const;
@@ -77,12 +84,15 @@ private:
   int prepare_next_char();
 
   ObCollationType coll_type_;
+  ObCharsetType cs_type_;
   const char *fulltext_;
   int64_t fulltext_len_;
 
   int64_t cursor_;
   int64_t next_char_len_;
   ObFTCharUtil::CharType next_char_type_;
+  ob_wc_t next_char_unicode_;
+  bool support_surrogate_;
 
   uint32_t handle_size_;
   bool is_smart_;
@@ -101,12 +111,20 @@ public:
 
   virtual ~ObIIKProcessor() {}
 
-  int process(TokenizeContext &ctx);
+  // The char info is handed in by the caller: every segmenter runs on the very same
+  // char, so fetching it once per char (instead of once per segmenter) avoids
+  // repeated accessor calls on the hot path.
+  int process(TokenizeContext &ctx,
+              const char *ch,
+              const uint8_t char_len,
+              const ObFTCharUtil::CharType type,
+              const ob_wc_t unicode);
 
   virtual int do_process(TokenizeContext &ctx,
                          const char *ch,
                          const uint8_t char_len,
-                         const ObFTCharUtil::CharType type)
+                         const ObFTCharUtil::CharType type,
+                         const ob_wc_t unicode)
       = 0;
 };
 

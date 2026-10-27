@@ -31,17 +31,15 @@ namespace oceanbase
 {
 namespace storage
 {
-int ObIIKProcessor::process(TokenizeContext &ctx)
+int ObIIKProcessor::process(TokenizeContext &ctx,
+                            const char *ch,
+                            const uint8_t char_len,
+                            const ObFTCharUtil::CharType type,
+                            const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
 
-  ObFTCharUtil::CharType type;
-  const char *ch = nullptr;
-  uint8_t char_len = 0;
-
-  if (OB_FAIL(ctx.current_char_type(type))) {
-  } else if (OB_FAIL(ctx.current_char(ch, char_len))) {
-  } else if (OB_FAIL(do_process(ctx, ch, char_len, type))) {
+  if (OB_FAIL(do_process(ctx, ch, char_len, type, unicode))) {
   }
   return ret;
 }
@@ -51,9 +49,11 @@ TokenizeContext::TokenizeContext(ObCollationType coll_type,
                                  const char *fulltext,
                                  int64_t fulltext_len,
                                  bool is_smart)
-    : coll_type_(coll_type), fulltext_(fulltext), fulltext_len_(fulltext_len), cursor_(0),
-      next_char_len_(0), handle_size_(0), is_smart_(is_smart), token_list_(allocator),
-      result_list_(allocator)
+    : coll_type_(coll_type), cs_type_(CHARSET_INVALID), fulltext_(fulltext),
+      fulltext_len_(fulltext_len), cursor_(0), next_char_len_(0),
+      next_char_type_(ObFTCharUtil::CharType::USELESS), next_char_unicode_(0),
+      support_surrogate_(false), handle_size_(0), is_smart_(is_smart),
+      token_list_(allocator), result_list_(allocator)
 {
 }
 
@@ -61,6 +61,8 @@ int TokenizeContext::init()
 {
   int ret = OB_SUCCESS;
 
+  cs_type_ = ObCharset::charset_type_by_coll(coll_type_);
+  support_surrogate_ = (CHARSET_UTF16 == cs_type_ || CHARSET_UTF16LE == cs_type_);
   if (OB_ISNULL(fulltext_) || fulltext_len_ <= 0) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(prepare_next_char())) {
@@ -99,6 +101,23 @@ int TokenizeContext::current_char_type(ObFTCharUtil::CharType &type)
   return ret;
 }
 
+int TokenizeContext::current_char_info(const char *&ch,
+                                       uint8_t &char_len,
+                                       ObFTCharUtil::CharType &type,
+                                       ob_wc_t &unicode)
+{
+  int ret = OB_SUCCESS;
+  if (cursor_ >= fulltext_len_) {
+    ret = OB_ITER_END;
+  } else {
+    ch = fulltext_ + cursor_;
+    char_len = next_char_len_;
+    type = next_char_type_;
+    unicode = next_char_unicode_;
+  }
+  return ret;
+}
+
 int TokenizeContext::prepare_next_char()
 {
   int ret = OB_SUCCESS;
@@ -106,9 +125,10 @@ int TokenizeContext::prepare_next_char()
                                           fulltext_ + cursor_,
                                           fulltext_len_ - cursor_,
                                           next_char_len_))) {
-  } else if (OB_FAIL(ObFTCharUtil::classify_first_char(coll_type_,
+  } else if (OB_FAIL(ObFTCharUtil::decode_and_classify(cs_type_,
                                                        fulltext_ + cursor_,
                                                        next_char_len_,
+                                                       next_char_unicode_,
                                                        next_char_type_))) {
   }
   return ret;
@@ -137,6 +157,8 @@ int TokenizeContext::step_next()
 }
 
 ObCollationType TokenizeContext::collation() const { return coll_type_; }
+
+ObCharsetType TokenizeContext::cs_type() const { return cs_type_; }
 
 int64_t TokenizeContext::get_end_cursor() const { return cursor_ + next_char_len_; }
 

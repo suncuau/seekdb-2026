@@ -131,14 +131,15 @@ int ObIKFTParser::produce()
 int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const char *ch,
                                    const uint8_t char_len,
-                                   const ObFTCharUtil::CharType type)
+                                   const ObFTCharUtil::CharType type,
+                                   const ob_wc_t unicode)
 {
   int ret = OB_SUCCESS;
   // proces by char with all segmenters
   for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
        OB_SUCC(ret) && iter != segmenters_.end();
        iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
+    if (OB_FAIL((*iter)->process(ctx, ch, char_len, type, unicode))) {
     }
   }
   return ret;
@@ -156,12 +157,12 @@ int ObIKFTParser::process_next_batch()
     ret = OB_ITER_END;
   } else {
     while (OB_SUCC(ret) && !do_seg && !ctx_->iter_end()) {
-      const char *ch;
+      const char *ch = nullptr;
       uint8_t char_len = 0;
       ObFTCharUtil::CharType type = ObFTCharUtil::CharType::USELESS;
-      if (OB_FAIL(ctx_->current_char(ch, char_len))) {
-      } else if (OB_FAIL(ctx_->current_char_type(type))) {
-      } else if (OB_FAIL(process_one_char(*ctx_, ch, char_len, type))) {
+      ob_wc_t unicode = 0;
+      if (OB_FAIL(ctx_->current_char_info(ch, char_len, type, unicode))) {
+      } else if (OB_FAIL(process_one_char(*ctx_, ch, char_len, type, unicode))) {
       } else {
         // 1. check segmention
         if (ctx_->handle_size() > SEGMENT_LIMIT && type == ObFTCharUtil::CharType::USELESS) {
@@ -228,16 +229,37 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
   return ret;
 }
 
-int ObIKFTParser::init_dict(const ObFTParserParam &param)
+int ObIKDictCache::get_dicts(ObFTDictHub *hub,
+                             ObIFTDict *&main_dict,
+                             ObIFTDict *&quan_dict,
+                             ObIFTDict *&stop_dict)
 {
   int ret = OB_SUCCESS;
-  ObIFTDict *tmp_dict = nullptr;
 
-  if (OB_ISNULL(hub_)) {
+  if (OB_ISNULL(hub)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (is_inited_ && hub_ != hub) {
+    // The dict hub is a process-wide singleton, so it only differs from the one
+    // the cache was built with when it has been destroyed and built again. The
+    // cached dictionaries belong to the old hub and must not be used.
+    destroy();
   }
 
-  ObFTRangeDict *dict = nullptr;
+  if (OB_FAIL(ret)) {
+  } else if (!is_inited_ && OB_FAIL(build(hub))) {
+  } else {
+    main_dict = main_dict_;
+    quan_dict = quan_dict_;
+    stop_dict = stop_dict_;
+  }
+
+  return ret;
+}
+
+int ObIKDictCache::build(ObFTDictHub *hub)
+{
+  int ret = OB_SUCCESS;
+
   ObFTDictDesc main_dict_desc("main_dict",
                               ObFTDictType::DICT_IK_MAIN,
                               ObCharsetType::CHARSET_UTF8MB4,
@@ -253,35 +275,81 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                                   ObCharsetType::CHARSET_UTF8MB4,
                                   ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  if (should_read_newest_table()) {
-    // clear dict cache, always false now
+  if (OB_FAIL(build_one_dict(hub, main_dict_desc, main_container_, main_dict_))) {
+  } else if (OB_FAIL(build_one_dict(hub, quan_dict_desc, quan_container_, quan_dict_))) {
+  } else if (OB_FAIL(build_one_dict(hub, stopword_dict_desc, stop_container_, stop_dict_))) {
   } else {
-    if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
-    } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
-    } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+    hub_ = hub;
+    is_inited_ = true;
   }
 
   return ret;
 }
 
-int ObIKFTParser::init_single_dict(ObFTDictDesc desc, ObFTCacheRangeContainer &container)
+int ObIKDictCache::build_one_dict(ObFTDictHub *hub,
+                                  const ObFTDictDesc &desc,
+                                  ObFTCacheRangeContainer &container,
+                                  ObIFTDict *&dict)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(hub_->load_cache(desc, container))) {
+
+  if (OB_FAIL(hub->load_cache(desc, container))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
-      if (OB_FAIL(hub_->build_cache(desc, container))) {
-      }
-    } else {
+      ret = hub->build_cache(desc, container);
     }
   }
+
+  if (OB_FAIL(ret)) {
+    // already logged
+  } else if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &alloc_, alloc_, &container, desc))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(dict->init())) {
+    OB_DELETEx(ObIFTDict, &alloc_, dict);
+  }
+
+  return ret;
+}
+
+void ObIKDictCache::destroy()
+{
+  if (!OB_ISNULL(main_dict_)) {
+    main_dict_->~ObIFTDict();
+    alloc_.free(main_dict_);
+    main_dict_ = nullptr;
+  }
+  if (!OB_ISNULL(quan_dict_)) {
+    quan_dict_->~ObIFTDict();
+    alloc_.free(quan_dict_);
+    quan_dict_ = nullptr;
+  }
+  if (!OB_ISNULL(stop_dict_)) {
+    stop_dict_->~ObIFTDict();
+    alloc_.free(stop_dict_);
+    stop_dict_ = nullptr;
+  }
+  main_container_.reset();
+  quan_container_.reset();
+  stop_container_.reset();
+  alloc_.reset();
+  hub_ = nullptr;
+  is_inited_ = false;
+}
+
+int ObIKFTParser::init_dict(const ObFTParserParam &param)
+{
+  int ret = OB_SUCCESS;
+  ObIKDictCache *dict_cache = nullptr;
+  UNUSED(param);
+
+  // For now there's no change of dict in one query, so the dictionaries can be
+  // pinned in a per-thread cache instead of being rebuilt for every parse.
+  if (OB_ISNULL(hub_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(dict_cache = GET_TSI(ObIKDictCache))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_FAIL(dict_cache->get_dicts(hub_, dict_main_, dict_quan_, dict_stop_))) {
+  }
+
   return ret;
 }
 
@@ -352,6 +420,7 @@ void ObIKFTParser::reset()
   if (!OB_ISNULL(ctx_)) {
     ctx_->~TokenizeContext();
     allocator_.free(ctx_);
+    ctx_ = nullptr;
   }
 
   for (ObIIKProcessor *segmenter : segmenters_) {
@@ -362,43 +431,14 @@ void ObIKFTParser::reset()
   }
   segmenters_.clear();
 
-  cache_main_.reset();
-  cache_quan_.reset();
-  cache_stop_.reset();
-
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
-  }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  // The dictionaries are owned by the per-thread ObIKDictCache, do not free them.
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
 
   is_inited_ = false;
 }
 
-bool ObIKFTParser::should_read_newest_table() const { return false; }
-int ObIKFTParser::build_dict_from_cache(const ObFTDictDesc &desc,
-                                        ObFTCacheRangeContainer &container,
-                                        ObIFTDict *&dict)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(hub_)) {
-    ret = OB_ERR_UNEXPECTED;
-  } else if (OB_ISNULL(dict = OB_NEWx(ObFTRangeDict, &allocator_, allocator_, &container, desc))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(dict->init())) {
-  }
-  if (OB_FAIL(ret)) {
-    OB_DELETEx(ObIFTDict, &allocator_, dict);
-  }
-  return ret;
-}
 
 } //  namespace storage
 } //  namespace oceanbase

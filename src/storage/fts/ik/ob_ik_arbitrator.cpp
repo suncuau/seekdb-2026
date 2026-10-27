@@ -115,14 +115,16 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
   ObIKTokenChain *chain = nullptr;
   for (int64_t current = 0; OB_SUCC(ret) && current < ctx.fulltext_len();) {
     ObFTCharUtil::CharType type;
+    ob_wc_t unicode = 0;
     // maybe not so good to keep single, check it later
     if (OB_FAIL(ObCharset::first_valid_char(ctx.collation(),
                                             ctx.fulltext() + current,
                                             ctx.fulltext_len() - current,
                                             char_len))) {
-    } else if (OB_FAIL(ObFTCharUtil::classify_first_char(ctx.collation(),
+    } else if (OB_FAIL(ObFTCharUtil::decode_and_classify(ctx.cs_type(),
                                                          ctx.fulltext() + current,
                                                          char_len,
+                                                         unicode,
                                                          type))) {
     } else if (ObFTCharUtil::CharType::USELESS == type) {
       current += char_len; // skip useless char
@@ -138,18 +140,14 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
         token.length_ = char_len;
         token.ptr_ = ctx.fulltext();
         token.char_cnt_ = 1;
-        bool is_ignore = false;
         if (ObFTCharUtil::CharType::CHINESE == type) {
           token.type_ = ObIKTokenType::IK_CHINESE_TOKEN;
           if (OB_FAIL(ctx.result_list().push_back(token))) {
           }
         } else if (ObFTCharUtil::CharType::OTHER_CJK == type) {
-          if (OB_FAIL(ObFTCharUtil::is_ignore_single_cjk(ctx.collation(),
-                                                         ctx.fulltext() + current,
-                                                         char_len,
-                                                         is_ignore))) {
-          } else if (!is_ignore && !FALSE_IT(token.type_ = ObIKTokenType::IK_OTHER_CJK_TOKEN)
-                     && OB_FAIL(ctx.result_list().push_back(token))) {
+          bool is_ignore = ObUnicodeBlockUtils::check_ignore_as_single(unicode);
+          if (!is_ignore && !FALSE_IT(token.type_ = ObIKTokenType::IK_OTHER_CJK_TOKEN)
+              && OB_FAIL(ctx.result_list().push_back(token))) {
           } else {
             // ignore
           }
